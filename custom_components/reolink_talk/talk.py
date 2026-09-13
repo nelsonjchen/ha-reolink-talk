@@ -190,8 +190,10 @@ def bcmedia_adpcm_packet(block: bytes) -> bytes:
     if len(block) < 5:
         raise ValueError("ADPCM block too small")
     payload_len = len(block) + 4  # + magic u16 + blocksize u16
-    # Neolink format: "block size without header, halved" (DVI-4 payload bytes / 2).
-    block_size = ((len(block) - 4) // 2)
+    # The device expects the ADPCM payload bytes per block, excluding the
+    # four-byte predictor/state header. This is the same value HA's working
+    # Reolink talk client passes as `blockSize`.
+    block_size = len(block) - 4
     header = struct.pack(
         "<IHHHH",
         0x62773130,  # MAGIC_HEADER_BCMEDIA_ADPCM
@@ -200,7 +202,9 @@ def bcmedia_adpcm_packet(block: bytes) -> bytes:
         0x0100,  # MAGIC_HEADER_BCMEDIA_ADPCM_DATA
         block_size,
     )
-    pad_len = (-len(block)) % 8
+    # Padding aligns the complete media payload, including the four-byte
+    # subheader, not the ADPCM block alone.
+    pad_len = (-payload_len) % 8
     return header + block + (b"\x00" * pad_len)
 
 
@@ -494,38 +498,34 @@ def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> by
     if not samples:
         return b""
 
-    # Streaming-style: each block header contains the current predictor + index
-    # (the "last output" state), followed by payload_samples ADPCM-coded samples.
-    predictor = int(samples[0])
-    step_index = 0
-    pos = 1  # first sample is used as initial predictor
-
+    samples_per_block = payload_samples + 1
+    total_blocks = (len(samples) + samples_per_block - 1) // samples_per_block
     out = bytearray()
-    while pos <= len(samples):
-        block = bytearray()
-        block += struct.pack("<hBB", predictor, step_index, 0)
+    step_index = 0
+    sample_offset = 0
 
+    for _ in range(total_blocks):
+        remaining = min(samples_per_block, len(samples) - sample_offset)
+        block_samples = list(samples[sample_offset : sample_offset + remaining])
+        pad_value = block_samples[-1]
+        block_samples.extend([pad_value] * (samples_per_block - remaining))
+
+        predictor = int(block_samples[0])
+        block = bytearray(struct.pack("<hBB", predictor, step_index, 0))
         nibble_acc = None
-        # Encode a fixed number of samples per block.
-        for _ in range(payload_samples):
-            s = int(samples[pos]) if pos < len(samples) else 0
-            pos += 1
-            nib, predictor, step_index = _ima_encode_nibble(s, predictor, step_index)
+        for sample in block_samples[1:]:
+            nib, predictor, step_index = _ima_encode_nibble(int(sample), predictor, step_index)
             if nibble_acc is None:
                 nibble_acc = nib
             else:
                 block.append((nibble_acc & 0xF) | ((nib & 0xF) << 4))
                 nibble_acc = None
+
         if nibble_acc is not None:
             block.append(nibble_acc & 0xF)
 
-        if len(block) < full_block_size:
-            block.extend(b"\x00" * (full_block_size - len(block)))
         out += block[:full_block_size]
-
-        # Stop once we've consumed all input samples and emitted at least one block.
-        if pos >= len(samples):
-            break
+        sample_offset += remaining
 
     return bytes(out)
 
@@ -743,7 +743,9 @@ async def talk_playback(
     # models/firmware. In practice, the WAV `block_align` coming out of ffmpeg is
     # the most reliable "bytes per ADPCM block" value for chunking and pacing.
     full_block_size = int(block_align or ability.length_per_encoder)
-    payloads = talk_binary_payload(adpcm_bytes, full_block_size, blocks_per_payload=4)
+    # Match the known-good dedicated Reolink talk session: one complete ADPCM
+    # block per Baichuan payload keeps NVR media framing unambiguous.
+    payloads = talk_binary_payload(adpcm_bytes, full_block_size, blocks_per_payload=1)
 
     try:
         for payload, blocks_in_payload in payloads:
